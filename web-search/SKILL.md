@@ -17,6 +17,13 @@ If the terminal shows `gbk codec can't encode` errors, set `PYTHONIOENCODING=utf
 PYTHONIOENCODING=utf-8 conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "query" --pretty
 ```
 
+## Platform notes (this machine, macOS)
+
+- `conda run` may be blocked by the sandbox (`__conda_exe: permission denied`). If so,
+  call the environment's python directly:
+  `/opt/miniconda3/envs/skills/bin/python <skill-dir>/scripts/search.py "query" --pretty`
+- Set `PYTHONIOENCODING=utf-8` when invoking the scripts directly.
+
 Parse the UTF-8 JSON before answering. Search results contain `title`, `url`, `snippet`, and `engine`. Fetch returns `final_url`, `status_code`, `title`, `content`, and extraction metadata.
 
 ## Search policy
@@ -75,6 +82,29 @@ WEBSEARCH_COOKIE_CACHE_MAX_AGE   # default: 7 days
 `--cookies` is an explicit cookie file for the current invocation. Its cookies are filtered by engine domain; a matching explicit file takes precedence for that engine and is not silently replaced by an automatic cache.
 
 `--browser-cookies off` disables automatic cookie fallback from the encrypted DPAPI cache and Cookie Editor export.
+
+### macOS: automatic cookie extraction from the local Edge profile
+
+**macOS only.** On macOS there is a faster path than the manual Cookie Editor export.
+The macOS helper `../frontier/tools/extract_bing_cookies.py` in this repository (also
+copied into your Frontier workspace by its init script) reads Bing cookies straight from
+the local Microsoft Edge profile
+(`~/Library/Application Support/Microsoft Edge/Default/Cookies`), derives the AES key
+from the keychain item "Microsoft Edge Safe Storage" (PBKDF2-SHA1, 1003 iterations —
+verified empirically against this Edge build 2026-09-09), decrypts (v10 AES-CBC), and
+writes the Cookie Editor JSON export to the configured export path
+(`~/.cc-switch/cache/bing.json` by default; override with `WEBSEARCH_COOKIE_CACHE`). Then
+rerun the search.
+
+```text
+<python> <frontier-dir>/tools/extract_bing_cookies.py bing.com
+```
+
+This depends on the macOS keychain, `~/Library/...` paths, and this Edge build's crypto
+format — it is NOT portable to Windows/Linux, where the DPAPI cache and Cookie Editor
+flow above remain the way. Also note: some Bing challenges are IP/proxy-reputation
+based and persist even with valid cookies (observed 2026-09-09); in that case report
+the challenge honestly and rely on DuckDuckGo/Baidu for the run.
 
 ## Fetch
 

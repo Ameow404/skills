@@ -1,0 +1,15 @@
+# Frontier workflow configuration — copy to ~/.frontier.env and edit, then source it
+# in your shell profile (.zshrc / .bashrc) or the scheduler's environment.
+
+# Where your Frontier workspace lives (WORKFLOW.md is copied there by scripts/init.sh)
+export FRONTIER_HOME="$HOME/frontier"
+
+# Python that has the web-search skill's dependencies (playwright, httpx, trafilatura...)
+export PYTHON_BIN="python3"
+
+# The web-search skill scripts (usually under ~/.claude/skills or ~/.cc-switch/skills)
+export SEARCH_SCRIPT="$HOME/.claude/skills/web-search/scripts/search.py"
+export FETCH_SCRIPT="$HOME/.claude/skills/web-search/scripts/fetch.py"
+
+# Where cookie exports for engines that need them are cached
+export COOKIE_CACHE="$HOME/.cc-switch/cache"

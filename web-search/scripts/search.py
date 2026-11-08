@@ -1211,6 +1211,300 @@ def search_duckduckgo_ddgs(
     return results
 
 
+# Bing's soft bot-detection serves reference-site noise instead of a challenge when
+# the request fingerprint looks scripted (fresh cookies do not help). If every result
+# comes from one of these hosts, treat the SERP as degraded and escalate.
+BING_NOISE_HOSTS = (
+    "wikipedia.org",
+    "wikimedia.org",
+    "wiktionary.org",
+    "baike.baidu.com",
+    "merriam-webster.com",
+    "britannica.com",
+    "dictionary.cambridge.org",
+    "thesaurus.com",
+    "collinsdictionary.com",
+    "oxfordlearnersdictionaries.com",
+    "ldoceonline.com",
+    "vocabulary.com",
+)
+
+
+def bing_results_degraded(results: list[dict[str, str]], query: str = "") -> bool:
+    """True when a Bing SERP looks like soft bot-detection output (noise or empty).
+
+    Two known degradation shapes: (1) reference-site noise (encyclopedia/dictionary
+    entries for every result); (2) brand-navigation packs — Bing reduces the query to
+    its first brand token and serves that brand's own homepages/drivers for a cold or
+    flagged session. Detect shape 2 as: over half of results on hosts whose first
+    label matches the query's first long token.
+    """
+    if not results:
+        return True
+    brand = ""
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", query):
+        brand = token.lower()
+        break
+    brand_hits = 0
+    noise_hits = 0
+    for result in results:
+        try:
+            host = (urlsplit(result.get("url", "")).hostname or "").lower()
+        except ValueError:
+            host = ""
+        is_noise = any(
+            host == noise or host.endswith("." + noise) for noise in BING_NOISE_HOSTS
+        )
+        if is_noise:
+            noise_hits += 1
+            continue
+        if brand:
+            bare = re.sub(r"^(www|m|en|zh|cn)\.", "", host)
+            if bare.split(".")[0] == brand:
+                brand_hits += 1
+    if noise_hits == len(results):
+        return True
+    if brand and brand_hits > len(results) / 2:
+        return True
+    return False
+
+
+def _bing_playwright_enabled() -> bool:
+    return os.getenv("FRONTIERS_BING_PLAYWRIGHT", "1").lower() not in {"0", "false", "no"}
+
+
+def search_bing_playwright(
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+    language: str,
+    specs: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Scrape the Bing SERP with headless Chromium: a real browser fingerprint
+    defeats the request-signature bot detection that degrades ddgs/httpx results."""
+    import asyncio
+
+    from playwright.async_api import async_playwright
+
+    mkt = "zh-CN" if language.startswith("zh") else "en-US"
+    count = max(5, min(int(max_results), 30))
+    serp_url = "https://www.bing.com/search?" + urlencode(
+        {"q": query, "count": str(count), "mkt": mkt, "setlang": mkt}
+    )
+    if not specs and "bing" in COOKIE_CACHE_ENGINES:
+        # Auto-load the Cookie Editor export for this engine so the browser gets the
+        # owner's logged-in session (fresh exports are written by the challenge flow
+        # and by tools/extract_bing_cookies.py). Best effort only.
+        with contextlib.suppress(Exception):
+            specs, _ = load_cookie_export_specs("bing")
+    pw_cookies: list[dict[str, Any]] = []
+    for spec in specs:
+        domain = (spec.get("domain") or "").lstrip(".").lower()
+        if not (domain == "bing.com" or domain.endswith(".bing.com")):
+            continue
+        name = (spec.get("name") or "").strip()
+        value = (spec.get("value") or "").strip()
+        if not name or not value:
+            continue
+        # Playwright rejects a whole add_cookies batch over one malformed entry
+        # (control chars, missing domain, bad expires) — sanitize per cookie and
+        # add one-by-one so a single bad cookie cannot void the session.
+        if any(ord(c) < 33 or ord(c) > 126 for c in name + value):
+            continue
+        cookie: dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "path": spec.get("path") or "/",
+        }
+        if domain:
+            cookie["domain"] = "." + domain
+        else:
+            cookie["url"] = "https://www.bing.com/"
+        raw_expires = spec.get("expires") or spec.get("expirationDate")
+        if raw_expires:
+            with contextlib.suppress(TypeError, ValueError):
+                expires = float(raw_expires)
+                if expires > 0:
+                    cookie["expires"] = int(expires)
+        same_site = (spec.get("sameSite") or "").lower()
+        if same_site in {"lax", "strict"}:
+            cookie["sameSite"] = same_site.title()
+        elif same_site in {"no_restriction", "none"}:
+            cookie["sameSite"] = "None"
+            cookie["secure"] = True
+        pw_cookies.append(cookie)
+
+    async def _search() -> list[dict[str, str]]:
+        async with async_playwright() as p:
+            proxy_cfg = {"server": proxy} if proxy else None
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_cfg,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            # Real-Chrome UA: Playwright's default carries "HeadlessChrome", which
+            # Bing treats as a bot signal and answers with a degraded SERP.
+            context = await browser.new_context(
+                locale=mkt.lower().replace("-", "_"),
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1512, "height": 982},
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            injected = 0
+            for cookie in pw_cookies:
+                try:
+                    await context.add_cookies([cookie])
+                    injected += 1
+                except Exception:
+                    continue
+            if pw_cookies and injected == 0:
+                # Every cookie was rejected — surface it instead of scraping bare.
+                raise WebSearchError(
+                    f"playwright-bing: all {len(pw_cookies)} cookies rejected as invalid"
+                )
+            page = await context.new_page()
+            html = ""
+            try:
+                try:
+                    await page.goto(
+                        serp_url,
+                        wait_until="domcontentloaded",
+                        timeout=int(timeout * 1000),
+                    )
+                except Exception:
+                    # Bing sometimes aborts the first goto with its own redirect.
+                    with contextlib.suppress(Exception):
+                        await page.wait_for_load_state("load", timeout=5000)
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("networkidle", timeout=6000)
+                with contextlib.suppress(Exception):
+                    await page.wait_for_selector(
+                        "li.b_algo", timeout=min(int(timeout * 1000), 8000)
+                    )
+                # page.content() raises while Bing churns its own navigation —
+                # retry until it settles.
+                for _ in range(4):
+                    try:
+                        html = await page.content()
+                        break
+                    except Exception:
+                        await page.wait_for_timeout(700)
+            finally:
+                await browser.close()
+
+        final_url = "https://www.bing.com/search"
+        soup = BeautifulSoup(html, "lxml")
+        results: list[dict[str, str]] = []
+        for li in soup.select("li.b_algo"):
+            anchor = li.select_one("h2 a") or li.select_one("a[href]")
+            if anchor is None:
+                continue
+            snippet_node = (
+                li.select_one(".b_caption p")
+                or li.select_one(".b_algoSlug")
+                or li.select_one("p")
+            )
+            snippet = snippet_node.get_text(" ", strip=True) if snippet_node else ""
+            result = make_result(
+                anchor.get_text(" ", strip=True),
+                anchor.get("href") or "",
+                snippet,
+                "bing",
+                final_url,
+            )
+            if result:
+                results.append(result)
+            if len(results) >= max_results:
+                break
+        return results
+
+    return asyncio.run(_search())
+
+
+def search_bing_news_rss(
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+) -> list[dict[str, str]]:
+    """Bing News vertical via its RSS output: bot-detection-free, fresh, plain httpx.
+    The most reliable Bing surface when the web SERP is degraded for scripted sessions."""
+    import xml.etree.ElementTree as ET
+
+    feed_url = "https://www.bing.com/news/search?" + urlencode(
+        {"q": query, "format": "RSS"}
+    )
+    with make_client(proxy, [], timeout) as client:
+        response = client.get(
+            feed_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                )
+            },
+        )
+    if response.status_code != 200 or "<rss" not in response.text[:300]:
+        raise WebSearchError(
+            f"bing news RSS returned HTTP {response.status_code}"
+        )
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as exc:
+        raise WebSearchError(f"bing news RSS parse failed: {exc}") from exc
+
+    from email.utils import parsedate_to_datetime
+
+    entries: list[tuple[Any, dict[str, str]]] = []
+    for item in root.findall(".//item"):
+        title = clean_text(item.findtext("title") or "")
+        link = (item.findtext("link") or "").strip()
+        description = clean_text(item.findtext("description") or "")
+        pub_date = (item.findtext("pubDate") or "").strip()
+        if not title or not link:
+            continue
+        sort_key = ""
+        if pub_date:
+            try:
+                sort_key = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                sort_key = ""
+        snippet = f"{description} [{sort_key}]" if sort_key else description
+        result = make_result(title, link, snippet, "bing", "https://www.bing.com/news")
+        if result:
+            entries.append((sort_key, result))
+    entries.sort(key=lambda pair: pair[0], reverse=True)
+    results = [entry[1] for entry in entries[:max_results]]
+    # Resolve Bing's apiclick redirect wrappers to the publisher URLs (best effort).
+    resolved: list[dict[str, str]] = []
+    with make_client(proxy, [], timeout) as client:
+        for result in results:
+            if "apiclick.aspx" not in result["url"]:
+                resolved.append(result)
+                continue
+            try:
+                probe = client.head(result["url"], follow_redirects=False)
+                location = probe.headers.get("location", "")
+                normalized = normalize_result_url(location, "https://www.bing.com")
+                if normalized:
+                    result = dict(result, url=normalized)
+            except Exception:
+                pass
+            resolved.append(result)
+    return resolved
+
+
 def search_news_one(
     engine: str,
     query: str,
@@ -1227,27 +1521,62 @@ def search_news_one(
 
     if specs or backend_mode == "html":
         backend = "httpx-html-news-cookies" if specs else "httpx-html-news"
-        return (
-            search_bing_news_html(
-                query, region, max_results, proxy, specs, timeout, language
-            ),
-            backend,
+        results = search_bing_news_html(
+            query, region, max_results, proxy, specs, timeout, language
         )
+        if results and not bing_results_degraded(results, query):
+            return results, backend
+        if backend_mode == "auto" and _bing_playwright_enabled():
+            try:
+                rss_results = search_bing_news_rss(
+                    query, region, max_results, proxy, timeout
+                )
+            except Exception:
+                rss_results = []
+            if rss_results:
+                return rss_results, "bing-news-rss"
+            if not results:
+                try:
+                    pw_results = search_bing_playwright(
+                        query, region, max_results, proxy, timeout, language, specs
+                    )
+                except Exception:
+                    pw_results = []
+                if pw_results:
+                    return pw_results, "playwright-bing-news-substitute"
+        return results, backend
 
     try:
-        return (
-            search_bing_news_ddgs(query, region, max_results, proxy, timeout),
-            "ddgs-news-bing",
-        )
+        results = search_bing_news_ddgs(query, region, max_results, proxy, timeout)
+        if results and not bing_results_degraded(results, query):
+            return results, "ddgs-news-bing"
     except Exception:
         if backend_mode == "ddgs":
             raise
-        return (
-            search_bing_news_html(
-                query, region, max_results, proxy, specs, timeout, language
-            ),
-            "httpx-html-news-fallback",
-        )
+        results = []
+    if backend_mode == "auto" and _bing_playwright_enabled():
+        try:
+            rss_results = search_bing_news_rss(
+                query, region, max_results, proxy, timeout
+            )
+        except Exception:
+            rss_results = []
+        if rss_results:
+            return rss_results, "bing-news-rss"
+        try:
+            pw_results = search_bing_playwright(
+                query, region, max_results, proxy, timeout, language, specs
+            )
+        except Exception:
+            pw_results = []
+        if pw_results:
+            return pw_results, "playwright-bing-news-substitute"
+    return (
+        search_bing_news_html(
+            query, region, max_results, proxy, specs, timeout, language
+        ),
+        "httpx-html-news-fallback",
+    )
 
 
 def search_arxiv_api(
@@ -1430,28 +1759,63 @@ def search_one(
                 "ddgs-duckduckgo",
             )
 
-    # DDGS has no cookie injection API. Use the HTML adapter when cookies are supplied.
-    if engine in {"bing"} and not specs and backend_mode != "html":
+    # Bing chain (auto mode): ddgs or httpx-html-cookies first, then a real-browser
+    # Chromium fetch when the SERP is empty/challenged/degraded, then the legacy
+    # httpx-html fallback. owner directive 2026-10-19: DDG must not be the first
+    # fallback for Bing — Playwright is.
+    if engine in {"bing"} and backend_mode != "html":
+        primary_backend = "httpx-html-cookies" if specs else "ddgs-bing-forced"
         try:
-            with _ddgs_lock:
-                return search_bing_ddgs(query, region, max_results, proxy, timeout), "ddgs-bing-forced"
+            if specs:
+                results = search_html_engine(
+                    engine, query, region, max_results, proxy, specs, timeout, language
+                )
+            else:
+                with _ddgs_lock:
+                    results = search_bing_ddgs(query, region, max_results, proxy, timeout)
         except Exception:
             if backend_mode == "ddgs":
                 raise
-            # Keep the operation useful if DDGS changes or Google changes its HTML.
-            return (
-                search_html_engine(
-                    engine,
-                    query,
-                    region,
-                    max_results,
-                    proxy,
-                    specs,
-                    timeout,
-                    language,
-                ),
-                "httpx-html-fallback",
-            )
+            results = []
+        if results and not bing_results_degraded(results, query):
+            return results, primary_backend
+        if backend_mode == "auto" and _bing_playwright_enabled():
+            try:
+                pw_results = search_bing_playwright(
+                    query, region, max_results, proxy, timeout, language, specs
+                )
+            except Exception:
+                pw_results = []
+            if pw_results and not bing_results_degraded(pw_results, query):
+                return pw_results, "playwright-bing"
+            # Both scripted surfaces degraded: try the news RSS surface, which
+            # carries no bot detection and often has the freshest coverage.
+            with contextlib.suppress(Exception):
+                rss_results = search_bing_news_rss(
+                    query, region, max_results, proxy, timeout
+                )
+                if rss_results:
+                    return rss_results, "bing-news-rss-web-substitute"
+            if pw_results:
+                return pw_results, "playwright-bing-degraded"
+        if results:
+            return results, f"{primary_backend}-degraded"
+        if backend_mode == "ddgs":
+            raise WebSearchError("bing ddgs returned no usable results")
+        # Keep the operation useful if DDGS changes or Google changes its HTML.
+        return (
+            search_html_engine(
+                engine,
+                query,
+                region,
+                max_results,
+                proxy,
+                specs,
+                timeout,
+                language,
+            ),
+            "httpx-html-fallback",
+        )
     backend = "httpx-html-cookies" if specs else "httpx-html"
     return (
         search_html_engine(
