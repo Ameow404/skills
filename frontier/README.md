@@ -25,6 +25,7 @@ frontier/
   config.example             ← environment variables to copy into your shell profile
   scripts/init.sh            ← create a workspace from the templates
   tools/extract_bing_cookies.py  ← optional macOS Edge cookie extractor (for Bing/Bilibili challenges)
+  tools/bili_dailies.py      ← optional CN discovery layer: pulls daily AI-digest videos from a watchlist of Bilibili UP主
   templates/
     CLAUDE.md                ← durable operating rules (goes to your workspace root)
     PROFILE.example.md       ← your profile + owner-priority clusters (edit this first)

@@ -69,7 +69,12 @@ Follow this sequence:
    page itself — headline-only recording of a major report is a miss.
 4c. CHINESE / ALTERNATE-ECOSYSTEM FRESHNESS (optional but recommended if the owner tracks
    CN tech): fetch the chosen CN news homepages, then run ≥2 Bilibili keyword searches via
-   the search page with cookies + `--render`. Record title/uploader/relative time and dedup.
+   the search page with cookies + `--render`. If the optional collector is present, run
+   `$PYTHON_BIN $FRONTIER_HOME/tools/bili_dailies.py --json /tmp/bili_dailies.json
+   --markdown /tmp/bili_dailies.md` first — it pulls the latest daily-digest videos from
+   the UP主 watchlist in `data/bili_watchlist.json` via Bilibili's web API. Read its digest
+   as a discovery layer; relay items remain LEADS until anchored. Record
+   title/uploader/relative time and dedup.
    SELF-REPAIR: if a search returns a JS shell/login wall or zero parseable titles,
    immediately re-run the cookie extractor for that domain, retry once, verify fresh
    titles appear, and only then continue. Never defer the fix to the next run.

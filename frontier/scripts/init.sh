@@ -21,6 +21,7 @@ cp "$HERE/templates/SOURCES.example.md" "$TARGET/SOURCES.md"
 cp "$HERE/WORKFLOW.md"                  "$TARGET/WORKFLOW.md"
 cp "$HERE/README.md"                    "$TARGET/FRONTIER_README.md"
 cp "$HERE/tools/extract_bing_cookies.py" "$TARGET/tools/extract_bing_cookies.py" 2>/dev/null || true
+cp "$HERE/tools/bili_dailies.py" "$TARGET/tools/bili_dailies.py" 2>/dev/null || true
 
 [ -f "$TARGET/data/events.jsonl" ] || : > "$TARGET/data/events.jsonl"
 [ -f "$TARGET/inbox/.gitkeep" ]    || : > "$TARGET/inbox/.gitkeep"
